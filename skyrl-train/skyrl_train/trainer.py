@@ -147,6 +147,7 @@ from skyrl_train.telemetry import (
     record_training_metrics,
 )
 from skyrl_train.rollout_observability import async_phase_window, monitor_event_loop_lag
+from skyrl_train.inference_engines.base import UNSTAMPED_POLICY_STEP
 from skyrl_train.utils.importance_ratio_diagnostics import mismatch_ratio_metrics
 from skyrl_train.timing_observability import StepWallTime, publish_startup_timings, publish_step_timings
 from skyrl_train.hf_export import (
@@ -267,6 +268,47 @@ def consumed_work(training_input: TrainingInputBatch) -> ConsumedWork:
         response_tokens=int(training_input["response_mask"][:real_rows].sum().item()),
         loss_tokens=int(training_input["loss_mask"][:real_rows].sum().item()),
     )
+
+
+def _token_staleness(
+    lease_staleness: Sequence[int], policy_steps: torch.Tensor | None, response_mask: torch.Tensor, global_step: int
+) -> torch.Tensor:
+    """Each response token's staleness: its lease's, unless the engine recorded the policy step that sampled it."""
+    lease = torch.tensor(lease_staleness, dtype=torch.int32).unsqueeze(1)
+    staleness = lease * response_mask.to(torch.int32)
+    if policy_steps is None:
+        return staleness
+    stamped = (policy_steps != UNSTAMPED_POLICY_STEP) & (response_mask > 0)
+    staleness = torch.where(stamped, global_step - policy_steps, staleness)
+    assert bool(((staleness >= 0) & (staleness <= lease)).all()), (
+        "a token's policy step must fall between its lease's step and the training step"
+    )
+    return staleness
+
+
+def _token_staleness_metrics(
+    staleness: torch.Tensor, loss_mask: torch.Tensor, policy_steps: torch.Tensor | None
+) -> Dict[str, float]:
+    """Staleness of loss-masked response tokens by engine stamp, beside the lease family ``async/staleness_*``."""
+    trained = loss_mask > 0
+    count = trained.count_nonzero().item()
+    if not count:
+        return {}
+    charged = staleness.masked_fill(~trained, 0)
+    metrics = {
+        "async/staleness_tokens_mean": charged.sum().item() / count,
+        "async/staleness_tokens_max": charged.max().item(),
+        "async/staleness_tokens_ratio": charged.count_nonzero().item() / count,
+        "async/staleness_tokens_stamped": 0.0,
+        "async/staleness_tokens_spanning": 0.0,
+    }
+    if policy_steps is not None:
+        stamped = trained & (policy_steps != UNSTAMPED_POLICY_STEP)
+        steps = policy_steps.masked_fill(~stamped, UNSTAMPED_POLICY_STEP)
+        spanning = (stamped & (steps < steps.amax(dim=1, keepdim=True))).any(dim=1)
+        metrics["async/staleness_tokens_stamped"] = stamped.count_nonzero().item() / count
+        metrics["async/staleness_tokens_spanning"] = spanning.float().mean().item()
+    return metrics
 
 
 def _zero_std_group_fraction(uids: Sequence[str], rewards: torch.Tensor) -> float:
@@ -1163,18 +1205,15 @@ class RayPPOTrainer:
                 await asyncio.to_thread(self.policy_model.offload_to_cpu, offload_optimizer=False, offload_model=True)
                 await self.inference_engine_client.wake_up(tags=["kv_cache"])
             else:
-                # Expert-block sync writes into live engine parameters, so the initial sync pauses generation too.
-                pause = reason != "initial" or self._expert_block_sync is not None
-                if pause:
-                    await self.inference_engine_client.pause_generation()
+                await self.inference_engine_client.pause_generation()
                 # Training backloads the optimizer before every step. Offload it after every update, including
                 # the initial sync, so Megatron gradient buffers are not resized while still on the GPU.
                 await asyncio.to_thread(
                     self._offload_policy_optimizer, timings, timer_label="offload_policy_optimizer_to_cpu"
                 )
                 await self.sync_policy_weights_to_inference_engines()
-                if pause:
-                    await self.inference_engine_client.resume_generation()
+                # The synced weights serve the leases that `_publish` opens next, under the same step number.
+                await self.inference_engine_client.resume_generation(policy_step=self.global_step + 1)
         self._log_weight_update_completed(reason=reason, duration_seconds=update_timer.duration)
         self._inference_policy_step = self.policy_version_step
 
@@ -2188,6 +2227,22 @@ class RayPPOTrainer:
             if len(rollout_routed_experts_rows) != len(response_ids):
                 raise ValueError("routed experts must have one row per response")
         distillation_tensors = _validated_distillation_tensors(trajectory_batch, response_masks_tensor)
+        # Policy steps are bounded by leases, so a batch without leases keeps zero staleness.
+        policy_steps = None
+        if rollout_staleness is None:
+            rollout_staleness_tensor = torch.zeros_like(response_masks_tensor, dtype=torch.int32)
+        else:
+            policy_steps = collate_response_token_channel(
+                trajectory_batch.get("rollout_policy_steps"),
+                response_masks_tensor,
+                dtype=torch.int32,
+                expected_lengths=[len(response) for response in response_ids],
+            )
+            rollout_staleness_tensor = _token_staleness(
+                rollout_staleness, policy_steps, response_masks_tensor, self.global_step
+            )
+        if self._training_metrics_enabled:
+            self.all_metrics.update(_token_staleness_metrics(rollout_staleness_tensor, loss_masks_tensor, policy_steps))
         training_input = TrainingInputBatch(
             {
                 "sequences": sequences_tensor,  # Full trajectories (padded and concatenated prompts and responses)
@@ -2196,10 +2251,7 @@ class RayPPOTrainer:
                 "rewards": rewards_tensor,
                 "loss_mask": loss_masks_tensor,
                 "rollout_logprobs": rollout_logprobs_tensor,
-                "rollout_staleness": torch.tensor(
-                    rollout_staleness if rollout_staleness is not None else [0] * len(response_ids),
-                    dtype=torch.int32,
-                ),
+                "rollout_staleness": rollout_staleness_tensor,
                 "is_last_step": (
                     torch.tensor(trajectory_batch["is_last_step"], dtype=torch.bool)
                     if trajectory_batch.get("is_last_step", None) is not None
@@ -2332,12 +2384,16 @@ class RayPPOTrainer:
                 candidates = candidates[:, :width]
                 chosen = chosen[:, :width]
                 weights = weights[:, :width]
+                rollout_staleness_tensor = rollout_staleness_tensor[:, :width]
                 extra = width - weights.shape[1]
                 candidates = torch.cat(
                     (candidates, candidates.new_full((len(response_ids), extra, candidates.shape[-1]), -1)), dim=1
                 )
                 chosen = torch.cat((chosen, chosen.new_zeros((len(response_ids), extra, chosen.shape[-1]))), dim=1)
                 weights = torch.cat((weights, weights.new_zeros((len(response_ids), extra))), dim=1)
+                rollout_staleness_tensor = torch.cat(
+                    (rollout_staleness_tensor, rollout_staleness_tensor.new_zeros((len(response_ids), extra))), dim=1
+                )
                 repair_mask = torch.zeros_like(weights, dtype=torch.bool)
                 for row, repair in enumerate(closure_targets.repairs):
                     if repair is not None:
@@ -2352,6 +2408,7 @@ class RayPPOTrainer:
                         "rewards": rewards_tensor,
                         "rollout_logprobs": learner_logprobs,
                         "loss_mask": learner_loss_masks,
+                        "rollout_staleness": rollout_staleness_tensor,
                         "ftpo_repair_mask": repair_mask,
                     }
                 )
@@ -2911,13 +2968,15 @@ class RayPPOTrainer:
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
+        # Only the mismatch statistics read token staleness, so the workers never receive it.
+        rollout_staleness = training_input.pop("rollout_staleness")
         if self._training_metrics_enabled and training_input.get("rollout_logprobs") is not None:
             self.all_metrics.update(
                 mismatch_ratio_metrics(
                     action_log_probs,
                     training_input["rollout_logprobs"],
                     training_input["loss_mask"],
-                    training_input["rollout_staleness"],
+                    rollout_staleness,
                     eps_clip_low=self.cfg.trainer.algorithm.eps_clip_low,
                     eps_clip_high=self.cfg.trainer.algorithm.eps_clip_high,
                 )
