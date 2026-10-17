@@ -57,6 +57,22 @@ class LearnerCudaMetrics:
                 peak_allocated_bytes=stats["allocated_bytes.all.peak"],
                 peak_reserved_bytes=stats["reserved_bytes.all.peak"],
             )
+        if boundary == "exit":
+            # Local diagnostic (spec-experiments): the telemetry event below goes to a backend that is not wired up outside Marin's infrastructure, so print the peaks too.
+            gib = 1024**3
+            logger.info(
+                "[cuda-mem] rank={} phase={} step={} outcome={} overlapped={} peak_alloc_gib={} peak_reserved_gib={} alloc_gib={:.1f} reserved_gib={:.1f} device_free_gib={:.1f}",
+                self._rank,
+                phase,
+                step,
+                outcome,
+                overlapped,
+                f"{fields['peak_allocated_bytes'] / gib:.1f}" if "peak_allocated_bytes" in fields else "n/a",
+                f"{fields['peak_reserved_bytes'] / gib:.1f}" if "peak_reserved_bytes" in fields else "n/a",
+                fields["allocated_bytes"] / gib,
+                fields["reserved_bytes"] / gib,
+                fields["device_free_bytes"] / gib,
+            )
         attributes = {**self._identity, "phase": phase, "boundary": boundary, "outcome": outcome}
         if step is not None:
             attributes["step"] = str(step)
