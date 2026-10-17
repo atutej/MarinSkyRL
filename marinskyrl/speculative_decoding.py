@@ -1,4 +1,4 @@
-"""Typed configuration contracts for EAGLE speculative decoding."""
+"""Typed configuration contracts for EAGLE-3 and DSpark speculative decoding."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class SpeculativeDecodingMethod(StrEnum):
     """Speculative methods supported by MarinSkyRL's managed lifecycle."""
 
     EAGLE3 = "eagle3"
+    DSPARK = "dspark"
 
 
 class SpeculatorModelSourceKind(StrEnum):
@@ -281,9 +282,14 @@ class SpeculativeDecodingConfig:
         try:
             method = SpeculativeDecodingMethod(mapping["method"])
         except (TypeError, ValueError) as error:
-            raise SpeculativeDecodingConfigError(f"{context}.method must be eagle3") from error
+            supported = ", ".join(item.value for item in SpeculativeDecodingMethod)
+            raise SpeculativeDecodingConfigError(f"{context}.method must be one of: {supported}") from error
 
         raw_training = mapping.get("training")
+        if raw_training is not None and method is not SpeculativeDecodingMethod.EAGLE3:
+            raise SpeculativeDecodingConfigError(
+                f"{context}.training is only supported for method eagle3, not {method.value}"
+            )
         training = (
             None
             if raw_training is None

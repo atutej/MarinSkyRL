@@ -179,3 +179,70 @@ def test_speculator_rejects_a_mutable_hub_revision(tmp_path: Path) -> None:
 
     with pytest.raises(SpeculativeDecodingConfigError, match="full 40-character"):
         parse_rl_config(str(_write_config(tmp_path, config)))
+
+
+def _dspark_config() -> dict:
+    value = _base_config()["generator"]["speculative_decoding"]
+    value["method"] = "dspark"
+    value["model"]["source_uri"] = "hf://open-athena/example-dspark-draft"
+    value["num_speculative_tokens"] = 8
+    del value["training"]
+    return value
+
+
+def test_dspark_speculator_is_served_through_vllm() -> None:
+    resolved = parse_speculative_decoding_config(
+        _dspark_config(),
+        backend="vllm",
+        run_engines_locally=True,
+        entrypoint="skyrl_train.entrypoints.main_base",
+        colocate_all=False,
+    )
+
+    assert resolved is not None
+    assert resolved.training is None
+    assert resolved.vllm_speculative_config() == {
+        "method": "dspark",
+        "model": "open-athena/example-dspark-draft",
+        "num_speculative_tokens": 8,
+        "revision": _DRAFT_REVISION,
+    }
+
+
+def test_dspark_rejects_online_training() -> None:
+    value = _dspark_config()
+    value["training"] = {"interval_steps": 1, "reserved_gpu_memory_gib": 8}
+
+    with pytest.raises(SpeculativeDecodingConfigError, match="only supported for method eagle3"):
+        parse_speculative_decoding_config(
+            value,
+            backend="vllm",
+            run_engines_locally=True,
+            entrypoint="skyrl_train.entrypoints.main_base",
+            colocate_all=False,
+        )
+
+
+def test_dspark_requires_a_separate_inference_placement() -> None:
+    with pytest.raises(SpeculativeDecodingConfigError, match="colocate_all=false"):
+        parse_speculative_decoding_config(
+            _dspark_config(),
+            backend="vllm",
+            run_engines_locally=True,
+            entrypoint="skyrl_train.entrypoints.main_base",
+            colocate_all=True,
+        )
+
+
+def test_unknown_method_lists_the_supported_ones() -> None:
+    value = _dspark_config()
+    value["method"] = "medusa"
+
+    with pytest.raises(SpeculativeDecodingConfigError, match="must be one of: eagle3, dspark"):
+        parse_speculative_decoding_config(
+            value,
+            backend="vllm",
+            run_engines_locally=True,
+            entrypoint="skyrl_train.entrypoints.main_base",
+            colocate_all=False,
+        )
