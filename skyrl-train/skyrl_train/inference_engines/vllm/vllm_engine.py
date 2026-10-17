@@ -591,7 +591,9 @@ class WorkerWrap:
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
         speculative_config = self.vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method == "eagle3":
+        # EAGLE-3 and DSpark drafts keep a reduced-vocabulary lm_head that is a frozen slice of the target's head
+        # (rows picked by draft_id_to_target_id); re-slice it after the policy weights change.
+        if speculative_config is not None and speculative_config.method in ("eagle3", "dspark"):
             self.model_runner.refresh_online_eagle_target_owned_weights()
 
     def begin_weight_update(self) -> None:
