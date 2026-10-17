@@ -246,3 +246,54 @@ def test_unknown_method_lists_the_supported_ones() -> None:
             entrypoint="skyrl_train.entrypoints.main_base",
             colocate_all=False,
         )
+
+
+def test_sampling_options_reach_vllm_only_when_set() -> None:
+    value = _dspark_config()
+    value["draft_sample_method"] = "probabilistic"
+    value["rejection_sample_method"] = "standard"
+
+    resolved = parse_speculative_decoding_config(
+        value,
+        backend="vllm",
+        run_engines_locally=True,
+        entrypoint="skyrl_train.entrypoints.main_base",
+        colocate_all=False,
+    )
+
+    assert resolved is not None
+    config = resolved.vllm_speculative_config()
+    assert config["draft_sample_method"] == "probabilistic"
+    assert config["rejection_sample_method"] == "standard"
+
+    default = parse_speculative_decoding_config(
+        _dspark_config(),
+        backend="vllm",
+        run_engines_locally=True,
+        entrypoint="skyrl_train.entrypoints.main_base",
+        colocate_all=False,
+    )
+    assert default is not None
+    assert "draft_sample_method" not in default.vllm_speculative_config()
+    assert "rejection_sample_method" not in default.vllm_speculative_config()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad", "match"),
+    [
+        ("draft_sample_method", "sampled", "draft_sample_method must be one of: greedy, probabilistic"),
+        ("rejection_sample_method", "synthetic", "rejection_sample_method must be one of: standard, block"),
+    ],
+)
+def test_sampling_options_reject_unsupported_values(field: str, bad: str, match: str) -> None:
+    value = _dspark_config()
+    value[field] = bad
+
+    with pytest.raises(SpeculativeDecodingConfigError, match=match):
+        parse_speculative_decoding_config(
+            value,
+            backend="vllm",
+            run_engines_locally=True,
+            entrypoint="skyrl_train.entrypoints.main_base",
+            colocate_all=False,
+        )

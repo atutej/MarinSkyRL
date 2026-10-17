@@ -30,6 +30,11 @@ class SpeculativeDecodingMethod(StrEnum):
     DSPARK = "dspark"
 
 
+# vLLM's draft / rejection sampling options (vllm.config.speculative). "synthetic" rejection is a benchmarking mode that needs extra fields, so it is not exposed.
+DRAFT_SAMPLE_METHODS = ("greedy", "probabilistic")
+REJECTION_SAMPLE_METHODS = ("standard", "block")
+
+
 class SpeculatorModelSourceKind(StrEnum):
     """Storage kinds supported by the draft-model lifecycle."""
 
@@ -57,6 +62,14 @@ def _reject_unknown(value: Mapping[str, Any], allowed: set[str], field: str) -> 
 def _positive_integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SpeculativeDecodingConfigError(f"{field} must be a positive integer, got {value!r}")
+    return value
+
+
+def _optional_choice(value: object, choices: tuple[str, ...], field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in choices:
+        raise SpeculativeDecodingConfigError(f"{field} must be one of: {', '.join(choices)}, got {value!r}")
     return value
 
 
@@ -266,6 +279,9 @@ class SpeculativeDecodingConfig:
     model: SpeculatorModelConfig
     num_speculative_tokens: int
     training: SpeculatorTrainingConfig | None
+    # None leaves vLLM's default ("greedy" drafting, "standard" rejection sampling) in place.
+    draft_sample_method: str | None = None
+    rejection_sample_method: str | None = None
 
     @classmethod
     def from_mapping(
@@ -275,7 +291,11 @@ class SpeculativeDecodingConfig:
         context: str = "generator.speculative_decoding",
     ) -> "SpeculativeDecodingConfig":
         mapping = _mapping(value, context)
-        _reject_unknown(mapping, {"method", "model", "num_speculative_tokens", "training"}, context)
+        _reject_unknown(
+            mapping,
+            {"method", "model", "num_speculative_tokens", "training", "draft_sample_method", "rejection_sample_method"},
+            context,
+        )
         missing = {field for field in ("method", "model", "num_speculative_tokens") if field not in mapping}
         if missing:
             raise SpeculativeDecodingConfigError(f"missing {context} fields: {', '.join(sorted(missing))}")
@@ -302,15 +322,26 @@ class SpeculativeDecodingConfig:
                 mapping["num_speculative_tokens"], f"{context}.num_speculative_tokens"
             ),
             training=training,
+            draft_sample_method=_optional_choice(
+                mapping.get("draft_sample_method"), DRAFT_SAMPLE_METHODS, f"{context}.draft_sample_method"
+            ),
+            rejection_sample_method=_optional_choice(
+                mapping.get("rejection_sample_method"), REJECTION_SAMPLE_METHODS, f"{context}.rejection_sample_method"
+            ),
         )
 
     def vllm_speculative_config(self) -> dict[str, Any]:
         """Return the serving fields understood by vLLM."""
-        return {
+        config: dict[str, Any] = {
             "method": self.method.value,
             **self.model.vllm_source_config(),
             "num_speculative_tokens": self.num_speculative_tokens,
         }
+        if self.draft_sample_method is not None:
+            config["draft_sample_method"] = self.draft_sample_method
+        if self.rejection_sample_method is not None:
+            config["rejection_sample_method"] = self.rejection_sample_method
+        return config
 
 
 def parse_speculative_decoding_config(
